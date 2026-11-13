@@ -1,0 +1,329 @@
+name: Build APK (Android 5+)
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Unzip project
+        run: |
+          mkdir app
+          unzip -q "$(ls *.zip | head -n 1)" -d app
+          if [ ! -f app/package.json ]; then
+            inner="$(dirname "$(find app -maxdepth 2 -name package.json | head -n 1)")"
+            mv "$inner"/* app/ 2>/dev/null || true
+          fi
+      - name: Install
+        working-directory: app
+        run: |
+          set -o pipefail
+          npm install --no-audit --no-fund 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+      - name: Build web
+        working-directory: app
+        run: |
+          set -o pipefail
+          npm run build 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+      - name: Add Android
+        working-directory: app
+        run: |
+          set -o pipefail
+          if [ ! -d android ]; then npx cap add android 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"; fi
+      - name: Lower minimum Android to 5.0
+        working-directory: app
+        run: |
+          sed -i -E 's/minSdkVersion *= *[0-9]+/minSdkVersion = 21/' android/variables.gradle
+          grep -n "minSdkVersion" android/variables.gradle
+      - name: Allow old Android for the file plugin
+        working-directory: app
+        run: |
+          python3 - <<'PY'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          if 'xmlns:tools' not in s:
+              s = s.replace('<manifest ', '<manifest xmlns:tools="http://schemas.android.com/tools" ', 1)
+          if 'overrideLibrary' not in s:
+              s = s.replace('<application', '<uses-sdk tools:overrideLibrary="io.ionic.libs.ionfilesystemlib,org.apache.cordova" />\n    <application', 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+          head -12 android/app/src/main/AndroidManifest.xml
+      - name: App icon
+        working-directory: app
+        run: |
+          if command -v magick >/dev/null 2>&1; then IM=magick
+          elif command -v convert >/dev/null 2>&1; then IM=convert
+          else echo "ImageMagick not found - keeping the default icon"; exit 0; fi
+          RES=android/app/src/main/res
+          for d in "mdpi 48 108" "hdpi 72 162" "xhdpi 96 216" "xxhdpi 144 324" "xxxhdpi 192 432"; do
+            set -- $d
+            $IM public/icon-512.png -resize ${2}x${2} $RES/mipmap-$1/ic_launcher.png || true
+            $IM public/icon-512.png -resize ${2}x${2} $RES/mipmap-$1/ic_launcher_round.png || true
+            $IM public/icon-maskable-512.png -resize ${3}x${3} $RES/mipmap-$1/ic_launcher_foreground.png || true
+          done
+          printf '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n  <color name="ic_launcher_background">#111E33</color>\n</resources>\n' > $RES/values/ic_launcher_background.xml
+      - name: Add file saver plugin
+        working-directory: app
+        run: |
+          MAIN="$(find android/app/src/main/java -name MainActivity.java | head -n 1)"
+          DIR="$(dirname "$MAIN")"
+          PKG="$(grep -m1 '^package ' "$MAIN" | sed -E 's/^package +([A-Za-z0-9_.]+);.*/\1/')"
+          echo "package: $PKG"
+          cat > "$DIR/FileSaverPlugin.java" <<'JAVA'
+          package __PKG__;
+
+          import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.Intent;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.provider.OpenableColumns;
+          import android.util.Base64;
+          import androidx.activity.result.ActivityResult;
+          import androidx.core.content.FileProvider;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.ActivityCallback;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.InputStream;
+          import java.io.FileOutputStream;
+
+          @CapacitorPlugin(name = "FileSaver")
+          public class FileSaverPlugin extends Plugin {
+
+            @PluginMethod
+            public void saveToCache(PluginCall call) {
+              String filename = call.getString("filename");
+              String data = call.getString("data");
+              if (filename == null || data == null) {
+                call.reject("filename and data are required");
+                return;
+              }
+              try {
+                File dir = new File(getContext().getCacheDir(), "exports");
+                if (!dir.exists()) dir.mkdirs();
+                File out = new File(dir, filename.replace("/", "_"));
+                byte[] bytes = Base64.decode(data, Base64.DEFAULT);
+                FileOutputStream fos = new FileOutputStream(out);
+                try {
+                  fos.write(bytes);
+                } finally {
+                  fos.close();
+                }
+                JSObject ret = new JSObject();
+                ret.put("uri", "file://" + out.getAbsolutePath());
+                ret.put("path", out.getAbsolutePath());
+                call.resolve(ret);
+              } catch (Exception e) {
+                call.reject("write failed: " + e.getMessage());
+              }
+            }
+
+            @PluginMethod
+            public void shareFile(PluginCall call) {
+              String path = call.getString("path");
+              String mime = call.getString("mime");
+              String title = call.getString("title");
+              if (path == null) {
+                call.reject("path is required");
+                return;
+              }
+              if (mime == null || mime.length() == 0) mime = "application/octet-stream";
+              if (title == null) title = "";
+              try {
+                Uri uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", new File(path));
+                Intent send = new Intent(Intent.ACTION_SEND);
+                send.setType(mime);
+                send.putExtra(Intent.EXTRA_STREAM, uri);
+                send.putExtra(Intent.EXTRA_SUBJECT, title);
+                send.setClipData(ClipData.newRawUri("", uri));
+                send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                Intent chooser = Intent.createChooser(send, title);
+                chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                getActivity().startActivity(chooser);
+                call.resolve();
+              } catch (Exception e) {
+                call.reject("share failed: " + e.getMessage());
+              }
+            }
+
+            @PluginMethod
+            public void shareText(PluginCall call) {
+              String text = call.getString("text");
+              String title = call.getString("title");
+              if (text == null) {
+                call.reject("text is required");
+                return;
+              }
+              if (title == null) title = "";
+              try {
+                Intent send = new Intent(Intent.ACTION_SEND);
+                send.setType("text/plain");
+                send.putExtra(Intent.EXTRA_TEXT, text);
+                send.putExtra(Intent.EXTRA_SUBJECT, title);
+                getActivity().startActivity(Intent.createChooser(send, title));
+                call.resolve();
+              } catch (Exception e) {
+                call.reject("share failed: " + e.getMessage());
+              }
+            }
+
+            @PluginMethod
+            public void pickFile(PluginCall call) {
+              try {
+                Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                String mimes = call.getString("mimes");
+                if (mimes != null && mimes.length() > 0 && mimes.indexOf(',') < 0) {
+                  i.setType(mimes);
+                } else {
+                  i.setType("*/*");
+                  if (mimes != null && mimes.length() > 0) {
+                    i.putExtra(Intent.EXTRA_MIME_TYPES, mimes.split(","));
+                  }
+                }
+                startActivityForResult(call, Intent.createChooser(i, "Select file"), "onFilePicked");
+              } catch (Exception e) {
+                call.reject("picker failed: " + e.getMessage());
+              }
+            }
+
+            @ActivityCallback
+            private void onFilePicked(PluginCall call, ActivityResult result) {
+              if (call == null) return;
+              try {
+                if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null || result.getData().getData() == null) {
+                  call.reject("cancelled");
+                  return;
+                }
+                Uri uri = result.getData().getData();
+                InputStream in = getContext().getContentResolver().openInputStream(uri);
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                byte[] buf = new byte[16384];
+                int n;
+                while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+                in.close();
+                String name = "file";
+                Cursor c = getContext().getContentResolver().query(uri, null, null, null, null);
+                if (c != null) {
+                  try {
+                    int idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                    if (idx >= 0 && c.moveToFirst()) name = c.getString(idx);
+                  } finally {
+                    c.close();
+                  }
+                }
+                String mime = getContext().getContentResolver().getType(uri);
+                JSObject ret = new JSObject();
+                ret.put("name", name);
+                ret.put("mime", mime == null ? "" : mime);
+                ret.put("data", Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP));
+                call.resolve(ret);
+              } catch (Exception e) {
+                call.reject("read failed: " + e.getMessage());
+              }
+            }
+
+            @PluginMethod
+            public void getLastCrash(PluginCall call) {
+              JSObject ret = new JSObject();
+              String text = "";
+              try {
+                File f = new File(getContext().getFilesDir(), "last_crash.txt");
+                if (f.exists()) {
+                  FileInputStream in = new FileInputStream(f);
+                  ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                  byte[] buf = new byte[4096];
+                  int n;
+                  while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+                  in.close();
+                  text = bos.toString("UTF-8");
+                  f.delete();
+                }
+              } catch (Exception e) {
+                text = "";
+              }
+              ret.put("text", text);
+              call.resolve(ret);
+            }
+          }
+          JAVA
+          cat > "$MAIN" <<'JAVA'
+          package __PKG__;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.PrintWriter;
+          import java.io.StringWriter;
+
+          public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              registerPlugin(FileSaverPlugin.class);
+              final Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
+              Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+                @Override
+                public void uncaughtException(Thread t, Throwable e) {
+                  try {
+                    StringWriter sw = new StringWriter();
+                    e.printStackTrace(new PrintWriter(sw));
+                    String text = "Android " + android.os.Build.VERSION.RELEASE + " / " + android.os.Build.MODEL + "\nThread: " + t.getName() + "\n" + sw.toString();
+                    if (text.length() > 6000) text = text.substring(0, 6000);
+                    FileOutputStream fos = new FileOutputStream(new File(getFilesDir(), "last_crash.txt"));
+                    fos.write(text.getBytes("UTF-8"));
+                    fos.close();
+                  } catch (Throwable ignored) {
+                  }
+                  if (previous != null) previous.uncaughtException(t, e);
+                }
+              });
+              super.onCreate(savedInstanceState);
+            }
+          }
+          JAVA
+          sed -i "s/__PKG__/$PKG/" "$DIR/FileSaverPlugin.java" "$MAIN"
+          grep -c "" "$DIR/FileSaverPlugin.java" "$MAIN"
+      - name: Sync
+        working-directory: app
+        run: |
+          set -o pipefail
+          npx cap sync android 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+      - name: Build APK
+        working-directory: app/android
+        run: |
+          set -o pipefail
+          chmod +x gradlew
+          ./gradlew assembleDebug --console=plain --stacktrace 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+      - name: Minimum Android in the built app
+        run: |
+          find app/android/app/build/intermediates -name AndroidManifest.xml -path "*merged_manifests*" -exec grep -ho 'minSdkVersion="[0-9]*"' {} \; | sort -u || true
+      - name: Failure summary
+        if: failure()
+        run: |
+          {
+            echo '### سبب الفشل'
+            echo '```'
+            grep -n -A14 "What went wrong" build.log | head -45 || true
+            echo '```'
+            echo '### آخر سطور السجل'
+            echo '```'
+            tail -n 25 build.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qasr-alsadaqa-android5-apk
+          path: app/android/app/build/outputs/apk/debug/app-debug.apk
